@@ -9,49 +9,75 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      # GitHub ubuntu-latest runner 已预装 Android SDK，直接复用，无需第三方 action 或重新下载
+      ANDROID_HOME: /usr/local/lib/android/sdk
     steps:
       # 1) 取出本仓库（含根目录的 ProductionApp.zip）
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 2) 安装 JDK 17（AGP 8.3 必需）
+      # 2) 安装 JDK 17（AGP 8.3 必需；setup-java 会自动导出 JAVA_HOME，供 sdkmanager 使用）
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
 
-      # 3) 安装并配置 Android SDK（自动设置 ANDROID_HOME）
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      # 4) 安装编译所需的 SDK 平台 / 构建工具，并接受许可协议
-      - name: Install SDK platform & build-tools, accept licenses
+      # 3) 复用 runner 预装的 SDK：把 cmdline-tools 的 bin 加入 PATH
+      #    （不再使用已废弃的 android-actions/setup-android，它会执行 `sdkmanager tools`
+      #     而新版 cmdline-tools 已无 tools 包，必失败）
+      - name: Configure Android SDK from runner's preinstalled SDK
         run: |
-          sdkmanager "platforms;android-34" "build-tools;34.0.0"
-          yes | sdkmanager --licenses
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          if [ -d "$ANDROID_HOME/cmdline-tools/latest/bin" ]; then
+            echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          else
+            echo "$ANDROID_HOME/cmdline-tools/16.0/bin" >> "$GITHUB_PATH"
+          fi
+          sdkmanager --version
 
-      # 5) 解压源码，并自动定位工程根目录（兼容任意压缩包顶层目录名）
+      # 4) 接受许可 + 仅安装本工程真正需要的平台与构建工具（runner 已预装 cmdline-tools 本体）
+      - name: Accept licenses & install SDK platform/build-tools
+        run: |
+          yes | sdkmanager --licenses
+          sdkmanager "platforms;android-34" "build-tools;34.0.0"
+
+      # 5) 校验源码 zip 是否已在仓库根目录
+      - name: Verify source zip exists
+        run: |
+          if [ ! -f ProductionApp.zip ]; then
+            echo "::error::仓库根目录未找到 ProductionApp.zip，请先上传该压缩包到仓库根目录"
+            exit 1
+          fi
+
+      # 6) 解压源码并自动定位工程根（兼容任意压缩包顶层目录名）
       - name: Unzip ProductionApp source
         run: |
           mkdir -p src
           unzip -o ProductionApp.zip -d src
-          echo "PROJECT_DIR=$(find src -name settings.gradle -exec dirname {} \; | head -1)" >> "$GITHUB_ENV"
+          PROJECT_DIR=$(find src -name settings.gradle -exec dirname {} \; | head -1)
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "::error::ProductionApp.zip 内未找到 settings.gradle，压缩包结构可能不对"
+            exit 1
+          fi
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Using project dir: $PROJECT_DIR"
 
-      # 6) 手动安装 Gradle 8.5（工程未含 gradle-wrapper.jar，不能走 ./gradlew）
+      # 7) 手动安装 Gradle 8.5（工程未含 gradle-wrapper.jar，不能走 ./gradlew）
       - name: Install Gradle 8.5
         run: |
           curl -L -o gradle.zip https://services.gradle.org/distributions/gradle-8.5-bin.zip
           unzip -o gradle.zip -d "$HOME/gradle"
           echo "$HOME/gradle/gradle-8.5/bin" >> "$GITHUB_PATH"
 
-      # 7) 构建 Debug APK（自带 debug 签名，无需额外配置；功能与 Release 一致）
+      # 8) 构建 Debug APK（自带 debug 签名，无需额外配置；功能与 Release 一致）
       - name: Build Debug APK
         run: |
           cd "$PROJECT_DIR"
-          gradle assembleDebug --no-daemon
+          gradle assembleDebug --no-daemon --stacktrace
 
-      # 8) 把生成的 APK 作为构建产物上传，可在 Actions 页面下载
+      # 9) 把生成的 APK 作为构建产物上传，可在 Actions 页面下载
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
@@ -59,7 +85,6 @@ jobs:
           path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/app-debug.apk
 
       # ===== 可选：改为构建可上架的 Release 签名包 =====
-      # 1. 在仓库 Settings → Secrets 添加：KEYSTORE_BASE64（keystore 文件 base64）、
-      #    KEY_ALIAS、KEY_PASSWORD、STORE_PASSWORD
-      # 2. 把第 7 步的参数改为 assembleRelease，并在 app/build.gradle 的 signingConfigs 中引用上述 secrets
-      # 3. 第 8 步 path 改为 app/build/outputs/apk/release/app-release.apk
+      # 1. 在仓库 Settings → Secrets 添加：KEYSTORE_BASE64、KEY_ALIAS、KEY_PASSWORD、STORE_PASSWORD
+      # 2. 把第 8 步参数改为 assembleRelease，并在 app/build.gradle 的 signingConfigs 引用上述 secrets
+      # 3. 第 9 步 path 改为 app/build/outputs/apk/release/app-release.apk
